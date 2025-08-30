@@ -1,0 +1,37 @@
+# --- OS cruft ---
+.DS_Store
+
+# --- Ceedling build artifacts (generated) ---
+fw/tests/build/
+
+# --- General build outputs ---
+build/
+fw/build-avr/
+fw/build-host/
+
+# --- Objects & deps ---
+*.o
+*.a
+*.d
+*.out
+
+# --- Firmware images & maps ---
+*.elf
+*.hex
+*.bin
+*.map
+*.lst
+
+# --- Coverage (if you enable gcov) ---
+*.gcno
+*.gcda
+*.gcov
+
+# --- Logs ---
+*.log
+
+# --- Editor/IDE ---
+.vscode/
+.idea/
+*.swp
+*.swo
