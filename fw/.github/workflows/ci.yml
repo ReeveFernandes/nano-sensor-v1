@@ -1,0 +1,54 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  build-test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install system deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential ruby-full
+
+      - name: Install Ceedling (Ruby gem)
+        run: gem install ceedling
+
+      - name: Run unit tests (Ceedling)
+        working-directory: fw/tests
+        run: ceedling test:all
+
+      - name: Build host self-test binary
+        run: |
+          mkdir -p fw/build-host
+          cc -std=c11 -Wall -Wextra -Ifw/include \
+            fw/src/crc16.c fw/src/frame.c fw/src/cmd_parser.c fw/src/wdt.c fw/src/selftest.c fw/src/main_host.c \
+            -o fw/build-host/selftest
+
+      - name: Run host self-test and assert PASS
+        run: |
+          set -e
+          ./fw/build-host/selftest | tee fw/build-host/selftest.log
+          grep -q "SELF-TEST PASS" fw/build-host/selftest.log
+
+      - name: (Optional) AVR compile smoke (no run)
+        run: |
+          sudo apt-get install -y gcc-avr avr-libc
+          mkdir -p fw/build-avr
+          avr-gcc -mmcu=atmega328p -DF_CPU=16000000UL -Os -std=gnu11 -Wall -Wextra -Ifw/include \
+            fw/src/crc16.c fw/src/frame.c fw/src/cmd_parser.c fw/src/wdt.c fw/src/selftest.c fw/src/main_host.c \
+            -o fw/build-avr/selftest_avr.elf || true
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-artifacts
+          path: |
+            fw/build-host/selftest
+            fw/build-host/selftest.log
+            fw/build-avr/selftest_avr.elf
