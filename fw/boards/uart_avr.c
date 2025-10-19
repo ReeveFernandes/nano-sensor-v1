@@ -2,30 +2,76 @@
 #include <avr/io.h>
 
 /**
- * @brief Initialize AVR UART0 for the requested baud rate (8N1).
+ * @brief Initialize UART0 for 115200 (or given baud), 8N1, RX+TX enabled.
  *
  * Whole-function summary:
- *   Computes the UBRR value for 16x UART mode, programs the baud registers,
- *   sets frame format to 8N1, and enables RX & TX.
+ *   Sets ATmega328P USART0 to double-speed mode for better 115200 accuracy,
+ *   configures PD1 (TX) as output and PD0 (RX) as input with pull-up,
+ *   enables both receiver and transmitter, sets 8 data bits / no parity /
+ *   1 stop bit, and flushes any stale RX data.
  *
- * Line-by-line notes clarify each register write.
+ * Line-by-line:
+ *   - Configure pins: PD1=output (TX), PD0=input (RX) + pull-up to keep idle high.
+ *   - Enable double-speed (U2X0=1) so UBRR calc uses F_CPU/(8*baud) - 1.
+ *   - Compute and set UBRR0H/L from F_CPU and baud.
+ *   - Enable RXEN0|TXEN0 to turn on receiver and transmitter.
+ *   - Set UCSZ01|UCSZ00 for 8 data bits, no parity, 1 stop (8N1).
+ *   - Drain any pending RX bytes from UDR0 so we start clean.
  */
-void uart_init(uint32_t baud) {
-    #ifndef F_CPU
-    #define F_CPU 16000000UL                       // Default to 16 MHz (Arduino Nano)
-    #endif
+void uart_init(uint32_t baud)
+{
+    /* --- Pins: PD1 (TX) output, PD0 (RX) input with pull-up --- */
+    DDRD  |= _BV(DDD1);        // TX pin as output
+    DDRD  &= ~_BV(DDD0);       // RX pin as input
+    PORTD |= _BV(PORTD0);      // Enable pull-up on RX (idle high for UART)
 
-    // Enable double-speed mode (U2X0=1) for better accuracy at high baud rates (e.g., 115200)
-    UCSR0A = (1 << U2X0);
+    /* --- Double-speed mode for accurate 115200 at 16 MHz --- */
+    UCSR0A = _BV(U2X0);
 
-    // Rounded UBRR for U2X mode: UBRR = (F_CPU/(8*baud)) - 1, with +4*baud to round
-    uint16_t ubrr = (uint16_t)((F_CPU + (baud * 4UL)) / (8UL * baud) - 1UL);
+    /* --- Baud divisor (rounded) for U2X0=1: UBRR = F_CPU/(8*baud) - 1 --- */
+    uint32_t ubrr = (F_CPU + (baud * 4UL)) / (8UL * baud) - 1UL;
+    UBRR0H = (uint8_t)(ubrr >> 8);
+    UBRR0L = (uint8_t)(ubrr & 0xFF);
 
-    UBRR0H = (uint8_t)(ubrr >> 8);                 // Set high byte of baud divider
-    UBRR0L = (uint8_t)(ubrr & 0xFF);               // Set low byte of baud divider
+    /* --- Enable receiver and transmitter (no interrupts) --- */
+    UCSR0B = _BV(RXEN0) | _BV(TXEN0);
 
-    UCSR0C = (1 << UCSZ01) | (1 << UCSZ00);        // 8 data bits, no parity, 1 stop (8N1)
-    UCSR0B = (1 << RXEN0) | (1 << TXEN0);          // Enable RX and TX
+    /* --- 8 data bits, no parity, 1 stop (8N1) --- */
+    UCSR0C = _BV(UCSZ01) | _BV(UCSZ00);
+
+    /* --- Flush stale RX bytes --- */
+    while (UCSR0A & _BV(RXC0)) { (void)UDR0; }
+}
+
+/**
+ * @brief Print key UART and GPIO registers once to verify RX is enabled.
+ *
+ * Whole-function summary:
+ *   Dumps UCSR0A/B/C, UBRR0H/L, DDRD, and PORTD in hex so we can confirm
+ *   the USART is configured for RX and that PD0 (RX pin) is input with pull-up.
+ *
+ * Line-by-line:
+ *   - Small hex helper prints a single byte as "0xHH".
+ *   - Print each register label and its current value, then CRLF.
+ */
+void uart_debug_dump(void)
+{
+    // ---- helper: print one byte as hex without printf ----
+    auto void put_hex8(uint8_t v) {
+        const char *hx = "0123456789ABCDEF";
+        uart_putc('0'); uart_putc('x');
+        uart_putc(hx[(v >> 4) & 0xF]);
+        uart_putc(hx[v & 0xF]);
+    };
+
+    uart_puts("[DBG] UCSR0A="); put_hex8(UCSR0A);
+    uart_puts(" UCSR0B=");     put_hex8(UCSR0B);
+    uart_puts(" UCSR0C=");     put_hex8(UCSR0C);
+    uart_puts(" UBRR0H=");     put_hex8(UBRR0H);
+    uart_puts(" UBRR0L=");     put_hex8(UBRR0L);
+    uart_puts(" DDRD=");       put_hex8(DDRD);
+    uart_puts(" PORTD=");      put_hex8(PORTD);
+    uart_puts("\r\n");
 }
 
 /**
@@ -83,17 +129,23 @@ void uart_puts(const char *s) {
 }
 
 /**
- * @brief Non-blocking read of one byte; returns -1 if no byte available.
+ * @brief Non-blocking read of one byte from UART0.
  *
  * Whole-function summary:
- *   Checks RXC0 (Receive Complete). If set, reads UDR0 and returns it.
- *   Otherwise, returns -1 immediately so callers can poll without blocking.
+ *   Returns the next received byte if available without blocking; otherwise
+ *   returns -1 to indicate “no data”. Safe to call frequently in a poll loop.
+ *
+ * Line-by-line:
+ *   - Check RXC0 flag (receive complete) in UCSR0A.
+ *   - If set, read UDR0 and return as int [0..255].
+ *   - If not set, return -1.
  */
-int uart_getc_nonblocking(void) {
-    if (UCSR0A & (1 << RXC0)) {                  // If a byte has been received...
-        return (int)UDR0;                        // ...read and return it (0..255)
+int uart_getc_nonblocking(void)
+{
+    if (UCSR0A & _BV(RXC0)) {        // Data received?
+        return (int)UDR0;            // Return byte (promoted to int)
     }
-    return -1;                                   // No data available
+    return -1;                       // No byte available
 }
 
 /**
