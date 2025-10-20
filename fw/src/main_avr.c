@@ -1,78 +1,76 @@
 /**
- * @brief Firmware entry point: init UART, run self-test, guard RX pin, poll protocol.
+ * @brief Minimal loop + timed streaming: service frames and send FT_DATA at rate.
  *
  * Whole-function summary:
- *   Brings up USART0 at 115200 (8N1) with RX+TX enabled, prints the boot banner,
- *   runs the self-test (using the new selftest_run(log,log_cap,err,err_cap) API),
- *   dumps UART/GPIO registers once for visibility, then enforces that PD0 (UART RX)
- *   stays as INPUT with pull-up while the protocol handler polls for framed commands.
+ *   - Initializes UART @115200, ADC on A0, and the framed protocol.
+ *   - Continuously services incoming frames (PING/START/STOP/SET_RATE/GET_STATUS).
+ *   - When g_sampling_on is true, every g_sample_rate_ms it reads ADC0 and sends
+ *     one FT_DATA frame containing the 16-bit sample (big-endian [hi, lo]).
  *
  * Notes:
- *   - Requires: uart_init(), uart_puts(), uart_debug_dump(), proto_init(), proto_poll_once().
- *   - Includes "proto.h" to avoid implicit-function warnings for proto_*.
+ *   - No boot banners or debug prints (wire stays binary-clean).
+ *   - Uses a simple 1 ms software tick via _delay_ms(1).
  */
-
-#include <avr/io.h>          // For DDRD/PORTD/UCSR0B bits
-#include <util/delay.h>      // For _delay_ms
+#include <avr/io.h>
+#include <util/delay.h>
 #include <stdbool.h>
-#include <stddef.h>
-#include "uart_avr.h"        // UART init/IO
-#include "selftest.h"        // selftest_run(...)
-#include "proto.h"           // proto_init(), proto_poll_once()
+#include "uart_avr.h"
+#include "proto.h"
+#include "cmd_parser.h"
+#include "adc_avr.h"
 
-/* Forward declaration for the debug print helper implemented in uart_avr.c */
-void uart_debug_dump(void);
+// Provide storage for externs so GET_STATUS/SET_RATE work.
+volatile uint16_t g_sample_rate_ms = 200;   // default 200 ms for a lively plot
+volatile bool     g_sampling_on     = false;
+
+// Forward from proto.c
+void proto_send_sample_u16(uint16_t sample_u16);
 
 int main(void) {
-    /* Initialize UART at 115200 baud, 8-N-1, RX+TX enabled */
-    uart_init(115200);                     // Hardware UART0 configured (RXEN0|TXEN0)
-    _delay_ms(50);                         // Small settle for the USB-serial adapter
+    // 1) UART up
+    uart_init(115200);
+    _delay_ms(10);
 
-    /* Boot banner */
-    uart_puts("[BOOT] Nano Sentinel starting...\n");
+    // 2) ADC on A0
+    adc_init();
 
-    /* Run self-test using the newer API that takes log and error buffers */
-    char log_buf[256] = {0};               // Collects human-friendly test transcript
-    char err_buf[128] = {0};               // Collects first error message (if any)
-    bool ok = selftest_run(log_buf, sizeof(log_buf), err_buf, sizeof(err_buf));
+    // 3) Guard RX pin and ensure RX stays enabled
+    DDRD  &= ~(1 << DDD0);    // PD0 as input
+    PORTD |=  (1 << PORTD0);  // pull-up ON
+    UCSR0B |=  (1 << RXEN0);  // RX enable
 
-    /* Print any self-test log lines (if the function filled the buffer) */
-    if (log_buf[0] != '\0') {
-        uart_puts(log_buf);                // Assumes NUL-terminated text in log_buf
-    }
-
-    /* Report PASS/FAIL and any error message */
-    if (ok) {
-        uart_puts("SELF-TEST PASS\r\n");
-    } else {
-        uart_puts("SELF-TEST FAIL\r\n");
-        if (err_buf[0] != '\0') {
-            uart_puts("[ERR] ");
-            uart_puts(err_buf);
-            uart_puts("\r\n");
-        }
-    }
-
-    /* One-time UART/GPIO register dump to verify RX is enabled and PD0 is input */
-    uart_debug_dump();                     // Prints UCSR0A/B/C, UBRR, DDRD, PORTD
-
-    /* Sanity-guard the UART RX pin: PD0 must be INPUT with pull-up (idle high) */
-    DDRD  &= ~_BV(DDD0);                   // Ensure PD0 is input
-    PORTD |=  _BV(PORTD0);                 // Enable pull-up on PD0
-
-    /* Initialize the framed-protocol handler (clears internal RX buffer) */
+    // 4) Protocol init
     proto_init();
 
-    /* Main loop: keep RX enabled, keep PD0 guarded, and poll the protocol */
-    while (1) {
-        /* Reassert guards each tick in case later code changes pins/registers */
-        DDRD  &= ~_BV(DDD0);               // PD0 stays input
-        PORTD |=  _BV(PORTD0);             // Pull-up stays on (UART idle high)
-        if (!(UCSR0B & _BV(RXEN0))) {      // If RX ever got disabled…
-            UCSR0B |= _BV(RXEN0);          // …re-enable it
-        }
+    // 5) Simple ms ticker and next-due schedule
+    uint32_t ms_tick = 0;
+    uint32_t next_due = 0;
 
-        /* Non-blocking protocol poll: ingests UART bytes, parses frames, replies */
+    while (1) {
+        // keep RX healthy
+        DDRD  &= ~(1 << DDD0);
+        PORTD |=  (1 << PORTD0);
+        if (!(UCSR0B & (1 << RXEN0))) UCSR0B |= (1 << RXEN0);
+
+        // service inbound framed commands
         proto_poll_once();
+
+        // 1 ms tick
+        _delay_ms(1);
+        ms_tick++;
+
+        // If streaming enabled, send a sample whenever due
+        if (g_sampling_on) {
+            if (ms_tick >= next_due) {
+                uint16_t s = adc_read10();              // 0..1023
+                proto_send_sample_u16(s);               // FT_DATA: [hi, lo]
+                // schedule next send (guard against rate=0 by enforcing >=10ms)
+                uint16_t period = (g_sample_rate_ms < 10) ? 10 : g_sample_rate_ms;
+                next_due = ms_tick + period;
+            }
+        } else {
+            // when stopped, follow status rate if someone changes it before starting
+            next_due = ms_tick + g_sample_rate_ms;
+        }
     }
 }

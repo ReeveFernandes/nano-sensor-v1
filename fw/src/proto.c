@@ -55,6 +55,36 @@ static void proto_send_reply(uint8_t reply_type,
 }
 
 /**
+ * @brief Send current status as an FT_STATUS frame immediately.
+ *
+ * Whole-function summary:
+ *   Builds a 3-byte payload [on][rate_hi][rate_lo] from the public globals
+ *   (g_sampling_on, g_sample_rate_ms), frames it as FT_STATUS (0x04) with
+ *   CRC16, and writes it out the UART.
+ *
+ * Line-by-line:
+ *   - Collect state into payload.
+ *   - frame_encode() builds the full wire frame into a small buffer.
+ *   - uart_write() transmits the result.
+ */
+void proto_send_status_now(void)
+{
+    extern volatile bool     g_sampling_on;
+    extern volatile uint16_t g_sample_rate_ms;
+
+    uint8_t payload[3];
+    payload[0] = g_sampling_on ? 1u : 0u;
+    payload[1] = (uint8_t)(g_sample_rate_ms >> 8);
+    payload[2] = (uint8_t)(g_sample_rate_ms & 0xFF);
+
+    uint8_t  frame[16];
+    uint16_t out_len = 0;
+    if (frame_encode(FT_STATUS, payload, 3, frame, sizeof(frame), &out_len) == FR_OK && out_len) {
+        uart_write(frame, out_len);
+    }
+}
+
+/**
  * @brief Handle one complete, validated inbound frame of type FT_DATA.
  *
  * Whole-function summary:
@@ -128,53 +158,98 @@ static void proto_resync_to_sync(void) {
 }
 
 /**
- * @brief Poll UART, parse complete frames, run commands, and send replies.
+ * @brief Poll UART, resync to 0xAA55, handle any complete frames (strict, silent).
  *
  * Whole-function summary:
- *   Non-blockingly ingests bytes from UART, realigns to the sync header
- *   (0xAA 0x55) if needed, and when a full frame is present it validates and
- *   decodes it, runs the command parser on the payload, and sends a framed
- *   reply. Dev echo / breadcrumbs are intentionally disabled here.
+ *   Non-blockingly ingests UART bytes into s_rx, realigns to sync if needed,
+ *   and when a complete frame is present calls proto_handle_frame(...) which
+ *   runs the command parser and transmits exactly one reply frame.
  */
 void proto_poll_once(void) {
-    /* 1) Ingest any available UART bytes into s_rx (bounded) */
+    // Ingest available bytes
     for (;;) {
-        int ch = uart_getc_nonblocking();          // Read one byte if available
-        if (ch < 0) break;                         // No more bytes this tick
+        int ch = uart_getc_nonblocking();
+        if (ch < 0) break;
         if (s_rx_len < RX_BUF_CAP) {
-            s_rx[s_rx_len++] = (uint8_t)ch;        // Append to RX buffer
+            s_rx[s_rx_len++] = (uint8_t)ch;
         } else {
-            s_rx_len = 0;                          // Overflow → drop buffer to resync
+            s_rx_len = 0;  // overflow → drop and resync
             break;
         }
     }
 
-    /* 2) Resync to the sync markers 0xAA 0x55 if needed */
-    proto_resync_to_sync();                         // Compact to the next AA 55
+    // Resync to sync bytes if needed
+    proto_resync_to_sync();
 
-    /* 3) Process complete frames at the front of s_rx */
+    // Process complete frames at buffer head
     for (;;) {
-        if (s_rx_len < 6) break;                    // Need header to know length
+        if (s_rx_len < 6) break; // need header
         if (!(s_rx[0] == FRAME_SYNC0 && s_rx[1] == FRAME_SYNC1)) {
             proto_resync_to_sync();
             if (s_rx_len < 6) break;
             if (!(s_rx[0] == FRAME_SYNC0 && s_rx[1] == FRAME_SYNC1)) break;
         }
+        uint16_t plen = (uint16_t)((s_rx[4] << 8) | s_rx[5]);
+        uint16_t need = (uint16_t)(6 + plen + 2);
+        if (s_rx_len < need) break;
 
-        /* Payload length is big-endian in bytes [4..5] */
-        uint16_t payload_len  = (uint16_t)((s_rx[4] << 8) | s_rx[5]);
-        uint16_t total_needed = (uint16_t)(6 + payload_len + 2);   // hdr + payload + CRC
+        // Handle one frame
+        proto_handle_frame(s_rx, need);
 
-        if (s_rx_len < total_needed) break;         // Not enough yet → wait
-
-        /* Handle the complete frame at the front */
-        proto_handle_frame(s_rx, total_needed);
-
-        /* Remove consumed frame by shifting remainder down */
-        uint16_t remaining = (uint16_t)(s_rx_len - total_needed);
+        // Remove consumed frame
+        uint16_t remaining = (uint16_t)(s_rx_len - need);
         if (remaining) {
-            memmove(s_rx, &s_rx[total_needed], remaining);
+            memmove(s_rx, &s_rx[need], remaining);
         }
         s_rx_len = remaining;
+    }
+}
+
+/**
+ * @brief Send one 16-bit sensor sample (big-endian) + 8-bit sequence as FT_DATA.
+ *
+ * Whole-function summary:
+ *   Builds a 3-byte payload: [sample_hi][sample_lo][seq] and frames it as
+ *   FT_DATA (0x01) with CRC16, then writes it out the UART.
+ *
+ * Line-by-line:
+ *   - Fill payload bytes from inputs (big-endian for the sample).
+ *   - Call frame_encode() to build a full frame into a small buffer.
+ *   - uart_write() transmits it in one go.
+ */
+void proto_send_data16(uint16_t sample, uint8_t seq)
+{
+    uint8_t payload[3];
+    payload[0] = (uint8_t)(sample >> 8);
+    payload[1] = (uint8_t)(sample & 0xFF);
+    payload[2] = seq;
+
+    uint8_t frame[16];
+    uint16_t out_len = 0;
+    frame_result_t r = frame_encode(FT_DATA, payload, 3, frame, sizeof(frame), &out_len);
+    if (r == FR_OK && out_len > 0) {
+        uart_write(frame, out_len);
+    }
+}
+
+/**
+ * @brief Send a single u16 sample as an FT_DATA frame.
+ *
+ * Whole-function summary:
+ *   Builds a 2-byte payload [hi, lo] from the 16-bit sample value and
+ *   frames it as FT_DATA (0x01) with CRC16, then transmits over UART.
+ *
+ * Parameters:
+ *   sample_u16 - sensor value to transmit (e.g., 0..1023 from ADC).
+ */
+void proto_send_sample_u16(uint16_t sample_u16) {
+    uint8_t payload[2];
+    payload[0] = (uint8_t)(sample_u16 >> 8);
+    payload[1] = (uint8_t)(sample_u16 & 0xFF);
+
+    uint8_t  frame[16];
+    uint16_t out_len = 0;
+    if (frame_encode(FT_DATA, payload, 2, frame, sizeof(frame), &out_len) == FR_OK && out_len) {
+        uart_write(frame, out_len);
     }
 }
